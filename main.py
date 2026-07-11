@@ -144,7 +144,8 @@ def get_data_module(cfg):
                                     pin_memory=cfg.pin_memory if "pin_memory" in cfg else True,
                                     persistent_workers=cfg.persistent_workers if "persistent_workers" in cfg else None,
                                     prefetch_factor=cfg.prefetch_factor if "prefetch_factor" in cfg else None,
-                                    train_drop_last=cfg.train_drop_last if "train_drop_last" in cfg else False)
+                                    train_drop_last=cfg.train_drop_last if "train_drop_last" in cfg else False,
+                                    semi_cfg=cfg.semi if "semi" in cfg else None)
     return data_module
 
 
@@ -167,6 +168,7 @@ def get_pl_module(cfg, model, metrics):
         warmup_steps=cfg.opt.warmup_steps,
         ignored_index=cfg.dataset.ignored_classes_metric,
         ignore_index=cfg.dataset.ignore_index if "ignore_index" in cfg.dataset else 0,
+        semi_cfg=cfg.semi if "semi" in cfg else None,
     )
     return pl_module
 

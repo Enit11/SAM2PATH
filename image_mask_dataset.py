@@ -45,23 +45,31 @@ def convert_color_mask(mask, mask_color_map=None, mask_color_mode="rgb"):
     elif mask_color_mode.lower() != "bgr":
         raise ValueError(f"Unsupported mask_color_mode: {mask_color_mode}")
 
-    converted = np.zeros(mask.shape[:2], dtype=np.uint8)
-    matched = np.zeros(mask.shape[:2], dtype=bool)
+    mask = np.ascontiguousarray(mask)
+    flat_mask = mask.reshape(-1, mask.shape[2])
+    pixel_dtype = np.dtype((np.void, flat_mask.dtype.itemsize * flat_mask.shape[1]))
+    flat_pixels = flat_mask.view(pixel_dtype).reshape(-1)
+
+    converted = np.zeros(flat_pixels.shape[0], dtype=np.uint8)
+    matched = np.zeros(flat_pixels.shape[0], dtype=bool)
 
     for color, cls_id in mask_color_map.items():
         if isinstance(color, str):
             color = tuple(int(v) for v in color.split(","))
-        color = np.asarray(color, dtype=np.uint8)
-        current = np.all(mask == color, axis=-1)
+        color_arr = np.asarray(color, dtype=np.uint8).reshape(1, -1)
+        if color_arr.shape[1] != flat_mask.shape[1]:
+            raise ValueError(f"Mask color {tuple(color_arr.reshape(-1).tolist())} has invalid channel count.")
+        color_key = color_arr.view(pixel_dtype).reshape(-1)[0]
+        current = flat_pixels == color_key
         converted[current] = int(cls_id)
         matched |= current
 
     if not np.all(matched):
-        unknown = np.unique(mask[~matched].reshape(-1, mask.shape[2]), axis=0)
+        unknown = np.unique(flat_mask[~matched], axis=0)
         preview = unknown[:8].tolist()
         raise ValueError(f"Unknown mask colors found: {preview}")
 
-    return converted
+    return converted.reshape(mask.shape[:2])
 
 
 def remap_label_mask(mask, label_map=None):
@@ -243,21 +251,46 @@ class FtMaskDataset(ImageMaskDataset):
 class UnlabeledImageDataset(Dataset):
     def __init__(
             self,
-            image_dir: str,
+            image_dir: str | None = None,
+            dataset_root: str | None = None,
+            source_csv_path: str | None = None,
+            labeled_csv_path: str | None = None,
             data_ext: str = ".png",
+            image_folder: str = SUB_FOLDER_IMAGE,
+            split_folders: bool = False,
             image_hw=(1024, 1024),
             dataset_mean=(0.485, 0.456, 0.406),
             dataset_std=(0.229, 0.224, 0.225),
     ):
         super().__init__()
-        self.image_dir = image_dir
         self.data_ext = data_ext
-        self.files = sorted(
-            f for f in os.listdir(image_dir)
-            if f.lower().endswith(data_ext.lower())
-        )
+        self.image_folder = image_folder
+        self.split_folders = split_folders
+        self.dataset_root = dataset_root
+
+        if source_csv_path is not None and dataset_root is not None:
+            self.image_dir = os.path.join(dataset_root, "train", image_folder) if split_folders else os.path.join(dataset_root, image_folder)
+            source_df = pd.read_csv(source_csv_path, header=0)
+            source_ids = set(source_df[source_df["is_test"] == 0]["img_id"].astype(str).tolist())
+            if labeled_csv_path is not None:
+                labeled_df = pd.read_csv(labeled_csv_path, header=0)
+                labeled_ids = set(labeled_df[labeled_df["is_test"] == 0]["img_id"].astype(str).tolist())
+                source_ids -= labeled_ids
+            self.files = sorted(
+                f"{img_id}{data_ext}" for img_id in source_ids
+                if os.path.exists(os.path.join(self.image_dir, f"{img_id}{data_ext}"))
+            )
+        elif image_dir is not None:
+            self.image_dir = image_dir
+            self.files = sorted(
+                f for f in os.listdir(image_dir)
+                if f.lower().endswith(data_ext.lower())
+            )
+        else:
+            raise ValueError("Either image_dir or (dataset_root and source_csv_path) must be provided.")
+
         if not self.files:
-            raise ValueError(f"No unlabeled images found in {image_dir}")
+            raise ValueError("No unlabeled images found for semi-supervised training.")
 
         height, width = image_hw
         self.weak_transform = albumentations.Compose([
@@ -332,20 +365,34 @@ class GeneralDataModule(LightningDataModule):
                                                                                           dataset_classs,
                                                                                           cus_transforms)
         if self.semi_cfg is not None and self.semi_cfg.get("enabled", False):
+            source_csv_path = self.semi_cfg.get("unlabeled_source_csv_path", None)
             image_dir = self.semi_cfg.get("unlabeled_image_dir", None)
-            if image_dir is None:
+            if source_csv_path is None and image_dir is None:
                 image_dir = os.path.join(common_cfg_dic["dataset_root"], "unlabeled", common_cfg_dic["image_folder"])
-            if not os.path.isdir(image_dir):
-                raise FileNotFoundError(
-                    f"Semi-supervised training is enabled, but unlabeled_image_dir does not exist: {image_dir}"
+            if source_csv_path is not None:
+                unlabeled_dataset = UnlabeledImageDataset(
+                    dataset_root=common_cfg_dic["dataset_root"],
+                    source_csv_path=source_csv_path,
+                    labeled_csv_path=common_cfg_dic["dataset_csv_path"] if self.semi_cfg.get("exclude_labeled_from_unlabeled", True) else None,
+                    data_ext=common_cfg_dic["data_ext"],
+                    image_folder=common_cfg_dic["image_folder"],
+                    split_folders=common_cfg_dic["split_folders"],
+                    image_hw=self.semi_cfg.get("image_hw", (1024, 1024)),
+                    dataset_mean=common_cfg_dic["dataset_mean"],
+                    dataset_std=common_cfg_dic["dataset_std"],
                 )
-            unlabeled_dataset = UnlabeledImageDataset(
-                image_dir=image_dir,
-                data_ext=common_cfg_dic["data_ext"],
-                image_hw=self.semi_cfg.get("image_hw", (1024, 1024)),
-                dataset_mean=common_cfg_dic["dataset_mean"],
-                dataset_std=common_cfg_dic["dataset_std"],
-            )
+            else:
+                if not os.path.isdir(image_dir):
+                    raise FileNotFoundError(
+                        f"Semi-supervised training is enabled, but unlabeled_image_dir does not exist: {image_dir}"
+                    )
+                unlabeled_dataset = UnlabeledImageDataset(
+                    image_dir=image_dir,
+                    data_ext=common_cfg_dic["data_ext"],
+                    image_hw=self.semi_cfg.get("image_hw", (1024, 1024)),
+                    dataset_mean=common_cfg_dic["dataset_mean"],
+                    dataset_std=common_cfg_dic["dataset_std"],
+                )
             self.dataset_train = SemiSupervisedDataset(
                 self.dataset_train,
                 unlabeled_dataset,
