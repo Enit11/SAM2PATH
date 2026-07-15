@@ -8,6 +8,8 @@ from torch import nn
 import torch.nn.functional as F
 from torchmetrics import MetricCollection
 import time
+import cv2
+import numpy as np
 
 from losses import SAMLoss
 
@@ -57,6 +59,20 @@ class SamSeg(LightningModule):
         self.mt_warmup_epochs = int(self.semi_cfg.get("warmup_epochs", 10))
         self.mt_use_mse = self.semi_cfg.get("loss_type", "mse").lower() == "mse"
         self.ema_decay = float(self.semi_cfg.get("ema_decay", 0.999))
+        self.proto_cfg = self.semi_cfg.get("prototype", {})
+        self.proto_enabled = self.semi_enabled and bool(self.proto_cfg.get("enabled", False))
+        self.proto_warmup_epochs = int(self.proto_cfg.get("warmup_epochs", 5))
+        self.proto_momentum = float(self.proto_cfg.get("momentum", 0.99))
+        self.proto_conf_threshold = float(self.proto_cfg.get("conf_threshold", 0.85))
+        self.proto_temperature = float(self.proto_cfg.get("temperature", 0.1))
+        self.proto_region_coef = float(self.proto_cfg.get("region_proto_coef", 0.05))
+        self.proto_intra_coef = float(self.proto_cfg.get("intra_region_coef", 0.02))
+        self.proto_sep_coef = float(self.proto_cfg.get("sep_coef", 0.0))
+        self.proto_min_region_pixels = int(self.proto_cfg.get("min_region_pixels", 6))
+        self.proto_min_region_purity = float(self.proto_cfg.get("min_region_purity", 0.7))
+        self.proto_max_regions_per_image = int(self.proto_cfg.get("max_regions_per_image", 16))
+        self.proto_max_pixels_per_region = int(self.proto_cfg.get("max_pixels_per_region", 128))
+        self.proto_use_unlabeled = bool(self.proto_cfg.get("use_unlabeled", True))
 
         self.time_and_cnt = [0., 0]
         self.teacher_model = None
@@ -65,6 +81,10 @@ class SamSeg(LightningModule):
             self.teacher_model.eval()
             for param in self.teacher_model.parameters():
                 param.requires_grad = False
+
+        if self.proto_enabled:
+            self.register_buffer("foundation_prototypes", torch.zeros(self.num_classes + 1, 0), persistent=True)
+            self.register_buffer("foundation_proto_ready", torch.zeros(self.num_classes + 1, dtype=torch.bool), persistent=True)
 
     def forward(self, images):
         # use forward for inference/predictions
@@ -76,12 +96,35 @@ class SamSeg(LightningModule):
 
         return pred_masks, iou_predictions
 
+    def forward_with_feature(self, images):
+        pred_masks, iou_predictions, features = self.model(images, return_feature=True)
+        pred_masks = torch.stack(pred_masks, dim=0)
+        iou_predictions = torch.stack(iou_predictions, dim=0)
+        features = self.normalize_feature_map(features)
+        return pred_masks, iou_predictions, features
+
     @torch.no_grad()
     def teacher_forward(self, images):
         pred_masks, iou_predictions = self.teacher_model(images)
         pred_masks = torch.stack(pred_masks, dim=0)
         iou_predictions = torch.stack(iou_predictions, dim=0)
         return pred_masks, iou_predictions
+
+    @torch.no_grad()
+    def teacher_forward_with_feature(self, images):
+        pred_masks, iou_predictions, features = self.teacher_model(images, return_feature=True)
+        pred_masks = torch.stack(pred_masks, dim=0)
+        iou_predictions = torch.stack(iou_predictions, dim=0)
+        features = self.normalize_feature_map(features)
+        return pred_masks, iou_predictions, features
+
+    def normalize_feature_map(self, features):
+        if features.ndim != 4:
+            raise ValueError(f"Expected 4D feature map, got shape {tuple(features.shape)}")
+        # Some SAM/SAM2 encoders return NHWC, while the prototype loss expects NCHW.
+        if features.shape[1] == features.shape[2] and features.shape[-1] > features.shape[1]:
+            features = features.permute(0, 3, 1, 2).contiguous()
+        return features
 
     def calc_loss(self, pred_masks, gt_masks, iou_predictions, ignored_masks, images=None):
         loss_dict = self.loss(pred_masks, gt_masks, iou_predictions, ignored_masks=ignored_masks, images=images)
@@ -134,25 +177,227 @@ class SamSeg(LightningModule):
         kl = F.kl_div(student_log_probs, teacher_probs, reduction="none").sum(dim=1)
         return kl[valid].mean()
 
+    def proto_active(self):
+        return self.proto_enabled and self.current_epoch >= self.proto_warmup_epochs
+
+    def ensure_prototypes(self, feature_dim, device):
+        if not self.proto_enabled:
+            return
+        if self.foundation_prototypes.numel() == 0:
+            self.foundation_prototypes = torch.zeros(self.num_classes + 1, feature_dim, device=device)
+            self.foundation_proto_ready = torch.zeros(self.num_classes + 1, dtype=torch.bool, device=device)
+
+    def resize_labels_for_feature(self, labels, feature_hw):
+        labels = labels.unsqueeze(1).float()
+        labels = F.interpolate(labels, size=feature_hw, mode="nearest")
+        return labels.squeeze(1).long()
+
+    def resize_conf_for_feature(self, confidence, feature_hw):
+        confidence = confidence.unsqueeze(1).float()
+        confidence = F.interpolate(confidence, size=feature_hw, mode="nearest")
+        return confidence.squeeze(1)
+
+    def iter_regions(self, label_map, valid_map=None):
+        label_np = label_map.detach().cpu().numpy().astype(np.int32)
+        if valid_map is None:
+            valid_np = np.ones_like(label_np, dtype=bool)
+        else:
+            valid_np = valid_map.detach().cpu().numpy().astype(bool)
+
+        regions = []
+        for cls_id in range(1, self.num_classes + 1):
+            cls_mask = (label_np == cls_id) & valid_np
+            if cls_mask.sum() < self.proto_min_region_pixels:
+                continue
+            num_labels, components = cv2.connectedComponents(cls_mask.astype(np.uint8), connectivity=8)
+            for comp_id in range(1, num_labels):
+                comp = components == comp_id
+                area = int(comp.sum())
+                if area < self.proto_min_region_pixels:
+                    continue
+                purity = float((label_np[comp] == cls_id).mean()) if area > 0 else 0.0
+                if purity < self.proto_min_region_purity:
+                    continue
+                regions.append((area, cls_id, comp))
+
+        regions.sort(key=lambda item: item[0], reverse=True)
+        return regions[: self.proto_max_regions_per_image]
+
+    @torch.no_grad()
+    def update_foundation_prototypes(self, teacher_features, labels, confidence=None):
+        if not self.proto_enabled:
+            return teacher_features.new_tensor(0.0)
+
+        self.ensure_prototypes(teacher_features.shape[1], teacher_features.device)
+        feature_hw = teacher_features.shape[-2:]
+        labels_small = self.resize_labels_for_feature(labels, feature_hw)
+        valid_small = labels_small > 0
+        if confidence is not None:
+            conf_small = self.resize_conf_for_feature(confidence, feature_hw)
+            valid_small = valid_small & (conf_small >= self.proto_conf_threshold)
+
+        updates = 0
+        for b_idx in range(teacher_features.shape[0]):
+            regions = self.iter_regions(labels_small[b_idx], valid_small[b_idx])
+            for _, cls_id, comp_np in regions:
+                comp = torch.from_numpy(comp_np).to(device=teacher_features.device, dtype=torch.bool)
+                region_feature = teacher_features[b_idx, :, comp].mean(dim=1)
+                region_feature = F.normalize(region_feature, dim=0)
+                if self.foundation_proto_ready[cls_id]:
+                    updated = (
+                        self.proto_momentum * self.foundation_prototypes[cls_id]
+                        + (1.0 - self.proto_momentum) * region_feature
+                    )
+                else:
+                    updated = region_feature
+                    self.foundation_proto_ready[cls_id] = True
+                self.foundation_prototypes[cls_id] = F.normalize(updated, dim=0)
+                updates += 1
+
+        return teacher_features.new_tensor(float(updates))
+
+    def region_prototype_losses(self, student_features, labels, confidence=None):
+        if not self.proto_enabled:
+            zero = student_features.new_tensor(0.0)
+            return zero, zero, zero
+
+        self.ensure_prototypes(student_features.shape[1], student_features.device)
+        ready_classes = torch.where(self.foundation_proto_ready[1:])[0] + 1
+        if ready_classes.numel() < 2:
+            zero = student_features.new_tensor(0.0)
+            return zero, zero, zero
+
+        feature_hw = student_features.shape[-2:]
+        labels_small = self.resize_labels_for_feature(labels, feature_hw)
+        valid_small = labels_small > 0
+        if confidence is not None:
+            conf_small = self.resize_conf_for_feature(confidence, feature_hw)
+            valid_small = valid_small & (conf_small >= self.proto_conf_threshold)
+
+        proto_bank = self.foundation_prototypes[ready_classes].detach()
+        proto_bank = F.normalize(proto_bank, dim=1)
+        region_losses = []
+        intra_losses = []
+        device = student_features.device
+
+        for b_idx in range(student_features.shape[0]):
+            regions = self.iter_regions(labels_small[b_idx], valid_small[b_idx])
+            for _, cls_id, comp_np in regions:
+                target_positions = torch.where(ready_classes == cls_id)[0]
+                if target_positions.numel() == 0:
+                    continue
+
+                comp = torch.from_numpy(comp_np).to(device=device, dtype=torch.bool)
+                pixel_features = student_features[b_idx, :, comp].transpose(0, 1)
+                if pixel_features.shape[0] > self.proto_max_pixels_per_region:
+                    pick = torch.randperm(pixel_features.shape[0], device=device)[: self.proto_max_pixels_per_region]
+                    pixel_features = pixel_features[pick]
+
+                pixel_features = F.normalize(pixel_features, dim=1)
+                region_feature = F.normalize(pixel_features.mean(dim=0), dim=0)
+                logits = torch.matmul(region_feature.unsqueeze(0), proto_bank.t()) / max(self.proto_temperature, 1e-6)
+                target = target_positions[:1].to(device=device)
+                region_losses.append(F.cross_entropy(logits, target))
+
+                intra = 1.0 - torch.matmul(pixel_features, region_feature)
+                intra_losses.append(intra.mean())
+
+        if not region_losses:
+            zero = student_features.new_tensor(0.0)
+            return zero, zero, self.prototype_separation_loss(ready_classes)
+
+        region_loss = torch.stack(region_losses).mean()
+        intra_loss = torch.stack(intra_losses).mean()
+        sep_loss = self.prototype_separation_loss(ready_classes)
+        return region_loss, intra_loss, sep_loss
+
+    def prototype_separation_loss(self, ready_classes):
+        if self.proto_sep_coef <= 0.0 or ready_classes.numel() < 2:
+            return self.foundation_prototypes.new_tensor(0.0)
+
+        prototypes = F.normalize(self.foundation_prototypes[ready_classes].detach(), dim=1)
+        sim = torch.matmul(prototypes, prototypes.t())
+        eye = torch.eye(sim.shape[0], device=sim.device, dtype=torch.bool)
+        sim = sim[~eye]
+        return F.relu(sim - 0.2).mean()
+
     def training_step(self, batch, batch_idx):
         if self.semi_enabled and isinstance(batch, dict):
             (images_l, gt_masks) = batch["labeled"]
             images_w, images_s = batch["unlabeled"]
             gt_masks, ignored_masks = self.process_masks(gt_masks)
 
-            pred_masks_l, iou_predictions_l = self(images_l)
+            if self.proto_enabled:
+                pred_masks_l, iou_predictions_l, student_features_l = self.forward_with_feature(images_l)
+            else:
+                pred_masks_l, iou_predictions_l = self(images_l)
+                student_features_l = None
             losses = self.calc_loss(pred_masks_l, gt_masks, iou_predictions_l, ignored_masks=ignored_masks, images=images_l)
 
             with torch.no_grad():
-                teacher_logits, _ = self.teacher_forward(images_w)
-            student_logits, _ = self(images_s)
+                if self.proto_enabled:
+                    teacher_logits, _, teacher_features_w = self.teacher_forward_with_feature(images_w)
+                    _, _, teacher_features_l = self.teacher_forward_with_feature(images_l)
+                else:
+                    teacher_logits, _ = self.teacher_forward(images_w)
+                    teacher_features_w = None
+                    teacher_features_l = None
+            if self.proto_enabled:
+                student_logits, _, student_features_s = self.forward_with_feature(images_s)
+            else:
+                student_logits, _ = self(images_s)
+                student_features_s = None
             mt_loss = self.consistency_loss(student_logits, teacher_logits)
             coef = self.mt_coef()
-            total_loss = losses["loss"] + coef * mt_loss
+
+            proto_region_loss = pred_masks_l.new_tensor(0.0)
+            proto_intra_loss = pred_masks_l.new_tensor(0.0)
+            proto_sep_loss = pred_masks_l.new_tensor(0.0)
+            proto_updates = pred_masks_l.new_tensor(0.0)
+            if self.proto_active():
+                with torch.no_grad():
+                    proto_updates = proto_updates + self.update_foundation_prototypes(teacher_features_l, gt_masks)
+                    if self.proto_use_unlabeled:
+                        teacher_probs = torch.softmax(teacher_logits, dim=1)
+                        teacher_conf, teacher_pseudo = teacher_probs.max(dim=1)
+                        teacher_pseudo = teacher_pseudo * (teacher_conf >= self.proto_conf_threshold).long()
+                        proto_updates = proto_updates + self.update_foundation_prototypes(
+                            teacher_features_w,
+                            teacher_pseudo,
+                            confidence=teacher_conf,
+                        )
+
+                proto_region_l, proto_intra_l, proto_sep_loss = self.region_prototype_losses(student_features_l, gt_masks)
+                if self.proto_use_unlabeled:
+                    proto_region_u, proto_intra_u, proto_sep_u = self.region_prototype_losses(
+                        student_features_s,
+                        teacher_pseudo,
+                        confidence=teacher_conf,
+                    )
+                    proto_region_loss = 0.5 * (proto_region_l + proto_region_u)
+                    proto_intra_loss = 0.5 * (proto_intra_l + proto_intra_u)
+                    proto_sep_loss = 0.5 * (proto_sep_loss + proto_sep_u)
+                else:
+                    proto_region_loss = proto_region_l
+                    proto_intra_loss = proto_intra_l
+
+            proto_total = (
+                self.proto_region_coef * proto_region_loss
+                + self.proto_intra_coef * proto_intra_loss
+                + self.proto_sep_coef * proto_sep_loss
+            )
+            total_loss = losses["loss"] + coef * mt_loss + proto_total
 
             self.log_losses(losses, "train")
             self.log("Loss/train_mt", mt_loss, on_epoch=True, on_step=True, sync_dist=True)
             self.log("Loss/train_mt_coef", torch.tensor(coef, device=self.device), on_epoch=True, on_step=True, sync_dist=True)
+            self.log("Loss/train_proto_region", proto_region_loss, on_epoch=True, on_step=True, sync_dist=True)
+            self.log("Loss/train_proto_intra", proto_intra_loss, on_epoch=True, on_step=True, sync_dist=True)
+            self.log("Loss/train_proto_sep", proto_sep_loss, on_epoch=True, on_step=True, sync_dist=True)
+            self.log("Loss/train_proto_total", proto_total, on_epoch=True, on_step=True, sync_dist=True)
+            self.log("Prototype/updates", proto_updates, on_epoch=True, on_step=True, sync_dist=True)
+            if self.proto_enabled:
+                self.log("Prototype/ready_classes", self.foundation_proto_ready[1:].float().sum(), on_epoch=True, on_step=True, sync_dist=True)
             self.log("Loss/train_total", total_loss, on_epoch=True, on_step=True, sync_dist=True)
 
             mask_cls_pred, gt_masks = self.predict_mask(pred_masks_l, gt_masks, ignored_masks=ignored_masks)

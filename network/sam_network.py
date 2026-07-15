@@ -85,7 +85,7 @@ class PromptSAM(nn.Module):
         self.no_sam = no_sam
 
 
-    def forward(self, images):
+    def forward(self, images, return_feature=False):
         H, W = self.mask_HW
 
         if not self.feature_input:
@@ -141,6 +141,8 @@ class PromptSAM(nn.Module):
             pred_masks.append(masks.squeeze(0))
             ious.append(iou_predictions.reshape(-1, 1))
 
+        if return_feature:
+            return pred_masks, ious, image_embeddings
         return pred_masks, ious
 
     def get_predictor(self):
@@ -242,7 +244,7 @@ class PromptSAMLateFusion(nn.Module):
             decoder_layer = nn.TransformerDecoderLayer(d_model=prompt_dim, nhead=8)
             self.dense_prompt_decoder = nn.TransformerDecoder(decoder_layer, num_layers=1)
 
-    def forward(self, images):
+    def forward(self, images, return_feature=False):
         H, W = self.mask_HW
 
         if not self.feature_input:
@@ -297,6 +299,8 @@ class PromptSAMLateFusion(nn.Module):
             pred_masks.append(masks.squeeze(0))
             ious.append(iou_predictions.reshape(-1, 1))
 
+        if return_feature:
+            return pred_masks, ious, image_embeddings
         return pred_masks, ious
 
     def get_predictor(self):
@@ -401,7 +405,7 @@ class PromptSAMLateFusion_NOKAN(nn.Module):
             decoder_layer = nn.TransformerDecoderLayer(d_model=prompt_dim, nhead=8)
             self.dense_prompt_decoder = nn.TransformerDecoder(decoder_layer, num_layers=1)
 
-    def forward(self, images):
+    def forward(self, images, return_feature=False):
         H, W = self.mask_HW
 
         if not self.feature_input:
@@ -456,6 +460,8 @@ class PromptSAMLateFusion_NOKAN(nn.Module):
             pred_masks.append(masks.squeeze(0))
             ious.append(iou_predictions.reshape(-1, 1))
 
+        if return_feature:
+            return pred_masks, ious, image_embeddings
         return pred_masks, ious
 
     def get_predictor(self):

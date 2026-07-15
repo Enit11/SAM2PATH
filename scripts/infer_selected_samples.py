@@ -31,12 +31,12 @@ def resolve_sample_name(name: str, image_dir: str) -> str | None:
 def main():
     project_root = PROJECT_ROOT
     ckpt_path = (
-        r"C:\Users\ASUS\SAM2PATH\outputs\glomeruli\run\glomeruli_train\Logs"
-        r"\20260520-202554\sam2path\version_0\checkpoints\epoch=39-step=7880.ckpt"
+        r"C:\Users\ASUS\SAM2PATH\outputs\glomeruli\run\glomeruli_10pct_mt_scfpb_seed42\Logs"
+        r"\20260712-002408\sam2path\version_0\checkpoints\epoch=99-step=17700.ckpt"
     )
     image_dir = r"C:\Users\ASUS\SAM2PATH\dataset\test\image"
     mask_dir = r"C:\Users\ASUS\SAM2PATH\dataset\test\mask"
-    output_dir = r"C:\Users\ASUS\SAM2PATH\vis_compare\selected_test_compare_gtmask"
+    output_dir = r"C:\Users\ASUS\SAM2PATH\vis_compare\selected_test_compare_scfpb"
 
     requested = [
         "05452-PAS-04",

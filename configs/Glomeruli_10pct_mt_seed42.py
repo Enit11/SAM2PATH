@@ -20,6 +20,21 @@ config["semi"] = {
     "conf_threshold": 0.8,
     "loss_type": "mse",
     "image_hw": (1024, 1024),
+    "prototype": {
+        "enabled": True,
+        "warmup_epochs": 5,
+        "momentum": 0.99,
+        "conf_threshold": 0.85,
+        "temperature": 0.1,
+        "region_proto_coef": 0.05,
+        "intra_region_coef": 0.02,
+        "sep_coef": 0.0,
+        "min_region_pixels": 6,
+        "min_region_purity": 0.7,
+        "max_regions_per_image": 16,
+        "max_pixels_per_region": 128,
+        "use_unlabeled": True,
+    },
 }
 
 cfg = Box(config)
