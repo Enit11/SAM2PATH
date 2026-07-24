@@ -139,7 +139,7 @@ class ImageMaskDataset(Dataset):
             self.img_list = self.read_cv_dataset_csv()
         else:
             if data_type == 'val':
-                data_type = 'test'
+                data_type = 'val'
                 self.data_type = data_type
             self.img_list = self.read_dataset_csv()
 
@@ -147,6 +147,10 @@ class ImageMaskDataset(Dataset):
         df = pd.read_csv(self.dataset_csv_path, header=0)
         if self.data_type in ['test']:
             df = df[df['is_test'] > 0]
+            if (df['is_test'] == 1).any():
+                df = df[df['is_test'] == 1]
+        elif self.data_type in ['val']:
+            df = df[df['is_test'] == 2]
         else:  # train
             df = df[df['is_test'] == 0]
         return df
@@ -176,6 +180,8 @@ class ImageMaskDataset(Dataset):
         img_id = row['img_id']
 
         split_root = os.path.join(self.dataset_root, self.data_type) if self.split_folders else self.dataset_root
+        if self.split_folders and self.data_type == "val":
+            split_root = os.path.join(self.dataset_root, "val")
         image_path = os.path.join(split_root, self.image_folder, img_id + self.data_ext)
         image = read_rgb_img(image_path)
         mask = read_mask(os.path.join(split_root, self.mask_folder, img_id + self.data_ext))

@@ -299,6 +299,105 @@ class GlomeruliInference:
         mask[~np.isin(mask, list(valid_classes) + [0])] = 0
         return mask
 
+    def structure_semantic_refinement(
+        self,
+        mask: np.ndarray,
+        prob_map: np.ndarray | None = None,
+        structure_classes: tuple[int, ...] = (1, 2, 3),
+        min_area: int = 900,
+        dominant_area_ratio: float = 0.68,
+        dominant_prob_margin: float = 0.05,
+        max_relabel_ratio: float = 0.32,
+        max_relabel_area: int = 9000,
+        surround_radius: int = 13,
+        min_surround_ratio: float = 0.48,
+        prob_tolerance: float = 0.08,
+    ) -> np.ndarray:
+        """Relabel only unreliable minority subregions inside a dominant structure."""
+        if prob_map is None:
+            return mask
+
+        valid_classes = [cls_id for cls_id in structure_classes if cls_id in self.valid_foreground_classes()]
+        if len(valid_classes) < 2:
+            return mask
+
+        out = mask.astype(np.uint8).copy()
+        foreground = np.isin(out, valid_classes).astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(foreground, 8)
+        kernel_size = max(1, 2 * surround_radius + 1)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+
+        for idx in range(1, num_labels):
+            area = int(stats[idx, cv2.CC_STAT_AREA])
+            if area < min_area:
+                continue
+
+            component = labels == idx
+            component_values = out[component]
+            class_areas = np.array([(component_values == cls_id).sum() for cls_id in valid_classes], dtype=np.float32)
+            if class_areas.sum() <= 0:
+                continue
+
+            area_ratio = class_areas / class_areas.sum()
+            mean_probs = np.array([prob_map[cls_id][component].mean() for cls_id in valid_classes], dtype=np.float32)
+            score = 0.5 * area_ratio + 0.5 * mean_probs
+            dominant_idx = int(score.argmax())
+            dominant_cls = int(valid_classes[dominant_idx])
+
+            sorted_score = np.sort(score)
+            score_margin = float(sorted_score[-1] - sorted_score[-2]) if len(sorted_score) > 1 else 1.0
+            is_reliable_instance = (
+                float(area_ratio[dominant_idx]) >= dominant_area_ratio
+                or score_margin >= dominant_prob_margin
+            )
+            if not is_reliable_instance:
+                continue
+
+            for cls_id in valid_classes:
+                if cls_id == dominant_cls:
+                    continue
+
+                minority = (out == cls_id) & component
+                if not np.any(minority):
+                    continue
+
+                num_minor, minor_labels, minor_stats, _ = cv2.connectedComponentsWithStats(
+                    minority.astype(np.uint8),
+                    8,
+                )
+                for minor_idx in range(1, num_minor):
+                    minor_area = int(minor_stats[minor_idx, cv2.CC_STAT_AREA])
+                    minor_ratio = minor_area / float(area)
+                    if minor_area > max_relabel_area and minor_ratio > max_relabel_ratio:
+                        continue
+                    if minor_ratio > max_relabel_ratio and float(area_ratio[dominant_idx]) < 0.82:
+                        continue
+
+                    minor_component = minor_labels == minor_idx
+                    dilated = cv2.dilate(minor_component.astype(np.uint8), kernel, iterations=1).astype(bool)
+                    ring = dilated & ~minor_component & component
+                    if np.any(ring):
+                        ring_values = out[ring]
+                        foreground_ring = ring_values[np.isin(ring_values, valid_classes)]
+                        dominant_surround_ratio = (
+                            float((foreground_ring == dominant_cls).sum()) / float(foreground_ring.size)
+                            if foreground_ring.size > 0
+                            else 0.0
+                        )
+                    else:
+                        dominant_surround_ratio = 0.0
+
+                    dominant_prob = float(prob_map[dominant_cls][minor_component].mean())
+                    minority_prob = float(prob_map[cls_id][minor_component].mean())
+                    probability_allows = dominant_prob + prob_tolerance >= minority_prob
+                    context_allows = dominant_surround_ratio >= min_surround_ratio
+                    strong_dominant = float(area_ratio[dominant_idx]) >= 0.82 and minor_ratio <= max_relabel_ratio
+
+                    if probability_allows or context_allows or strong_dominant:
+                        out[minor_component] = dominant_cls
+
+        return out
+
     def postprocess_prediction(self, mask: np.ndarray, prob_map: np.ndarray | None = None) -> np.ndarray:
         valid_classes = set(self.valid_foreground_classes())
         if prob_map is not None:
@@ -308,10 +407,23 @@ class GlomeruliInference:
                 prob_map[0] = np.maximum(prob_map[0], prob_map[invalid_classes].max(axis=0))
                 prob_map[invalid_classes] = 0
         mask = self.suppress_invalid_classes(mask)
+        mask = self.structure_semantic_refinement(mask, prob_map=prob_map)
         mask = self.relabel_small_components(mask)
         mask = self.refine_enclosed_components(mask)
         mask = self.apply_morphology(mask)
         mask = self.fill_small_background_holes(mask)
+        mask = self.structure_semantic_refinement(
+            mask,
+            prob_map=prob_map,
+            min_area=700,
+            dominant_area_ratio=0.70,
+            dominant_prob_margin=0.05,
+            max_relabel_ratio=0.26,
+            max_relabel_area=5500,
+            surround_radius=9,
+            min_surround_ratio=0.55,
+            prob_tolerance=0.06,
+        )
         mask = self.refine_enclosed_components(
             mask,
             max_area_by_class={

@@ -3,7 +3,8 @@ from box import Box
 from configs.Glomeruli import config as base_config
 
 config = deepcopy(base_config)
-config["dataset"]["dataset_csv_path"] = "dataset_cfg/glomeruli_10pct_seed42.csv"
+config["dataset"]["dataset_root"] = "dataset_patient_split_seed42"
+config["dataset"]["dataset_csv_path"] = "dataset_cfg/glomeruli_10pct_patient_split_seed42.csv"
 config["opt"]["num_epochs"] = 100
 config["batch_size"] = 2
 config["num_workers"] = 2
@@ -11,7 +12,7 @@ config["persistent_workers"] = False
 config["prefetch_factor"] = 2
 config["semi"] = {
     "enabled": True,
-    "unlabeled_source_csv_path": "dataset_cfg/glomeruli_cv.csv",
+    "unlabeled_source_csv_path": "dataset_cfg/glomeruli_patient_split_seed42.csv",
     "exclude_labeled_from_unlabeled": True,
     "unlabeled_ratio": 1,
     "ema_decay": 0.999,
@@ -34,6 +35,19 @@ config["semi"] = {
         "max_regions_per_image": 16,
         "max_pixels_per_region": 128,
         "use_unlabeled": True,
+        "sipp": {
+            "enabled": True,
+            "classes": [1, 2, 3],
+            "warmup_epochs": 5,
+            "conf_threshold": 0.9,
+            "min_region_pixels": 32,
+            "max_regions_per_image": 16,
+            "boundary_width": 3,
+            "instance_proto_coef": 0.02,
+            "purity_coef": 0.01,
+            "broadcast_coef": 0.005,
+            "unlabeled_weight": 0.5,
+        },
     },
 }
 

@@ -10,12 +10,13 @@ from sam2path_inference import GlomeruliInference
 
 def resolve_sample_name(name: str, image_dir: str) -> str | None:
     stem = name if name.lower().endswith(".png") else f"{name}.png"
+    normalized_stem = stem.replace("-", "").lower()
     direct = os.path.join(image_dir, stem)
     if os.path.exists(direct):
         return stem
 
     candidates = sorted(
-        f for f in os.listdir(image_dir) if f.lower().endswith(".png") and f.replace("-", "") == stem.replace("-", "")
+        f for f in os.listdir(image_dir) if f.lower().endswith(".png") and f.replace("-", "").lower() == normalized_stem
     )
     if candidates:
         return candidates[0]
@@ -24,6 +25,12 @@ def resolve_sample_name(name: str, image_dir: str) -> str | None:
         alt = stem.replace("05452", "08452", 1)
         if os.path.exists(os.path.join(image_dir, alt)):
             return alt
+        normalized_alt = alt.replace("-", "").lower()
+        candidates = sorted(
+            f for f in os.listdir(image_dir) if f.lower().endswith(".png") and f.replace("-", "").lower() == normalized_alt
+        )
+        if candidates:
+            return candidates[0]
 
     return None
 
@@ -31,12 +38,12 @@ def resolve_sample_name(name: str, image_dir: str) -> str | None:
 def main():
     project_root = PROJECT_ROOT
     ckpt_path = (
-        r"C:\Users\ASUS\SAM2PATH\outputs\glomeruli\run\glomeruli_10pct_mt_scfpb_seed42\Logs"
-        r"\20260712-002408\sam2path\version_0\checkpoints\epoch=99-step=17700.ckpt"
+        r"C:\Users\ASUS\SAM2PATH\outputs\glomeruli\run\glomeruli_10pct_mt_scfpb_sipp_seed42\Logs"
+        r"\20260722-003303\sam2path\version_0\checkpoints\epoch=99-step=17700.ckpt"
     )
     image_dir = r"C:\Users\ASUS\SAM2PATH\dataset\test\image"
     mask_dir = r"C:\Users\ASUS\SAM2PATH\dataset\test\mask"
-    output_dir = r"C:\Users\ASUS\SAM2PATH\vis_compare\selected_test_compare_scfpb"
+    output_dir = r"C:\Users\ASUS\SAM2PATH\vis_compare\selected_test_compare_sipp_instance_refined"
 
     requested = [
         "05452-PAS-04",
