@@ -104,6 +104,7 @@ class MaskDecoder(nn.Module):
         sparse_prompt_embeddings: torch.Tensor,
         dense_prompt_embeddings: torch.Tensor,
         multimask_output: bool,
+        return_all_masks: bool = False,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Predict masks given image and prompt embeddings.
@@ -115,6 +116,9 @@ class MaskDecoder(nn.Module):
           dense_prompt_embeddings (torch.Tensor): the embeddings of the mask inputs
           multimask_output (bool): Whether to return multiple masks or a single
             mask.
+          return_all_masks (bool): Return every mask token, including token 0.
+            This is used for mutually exclusive semantic classes where token 0
+            represents the background class.
 
         Returns:
           torch.Tensor: batched predicted masks
@@ -128,7 +132,9 @@ class MaskDecoder(nn.Module):
         )
 
         # Select the correct mask or masks for output
-        if multimask_output:
+        if return_all_masks:
+            mask_slice = slice(None)
+        elif multimask_output:
             mask_slice = slice(1, None)
         else:
             mask_slice = slice(0, 1)

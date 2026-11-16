@@ -1,9 +1,0 @@
-
-项目结构里，main.py 是训练入口，
-configs/Glomeruli.py 是你这套 glomeruli 数据的训练配置，
-image_mask_dataset.py 负责读 dataset/train/image 和 dataset/train/mask，
-pl_module_sam_seg.py 封装了 Lightning 的训练/验证逻辑，
-network/ 里是 SAM/SAM2 模型改造部分，losses.py 是损失函数。
-
-流程是：main.py 读配置 -> 构建数据集 -> 构建模型 -> 包装成 LightningModule -> Trainer.fit() 开始训练。
-你这个数据里，mask 是彩色标注，mask_04 是 0-3 的离散标签版；当前代码默认读的是 mask，这套是对的。

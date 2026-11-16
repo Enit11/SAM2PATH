@@ -101,6 +101,10 @@ class ImageMaskDataset(Dataset):
             mask_color_map=None,
             mask_color_mode: str = "rgb",
             label_map=None,
+            train_label_column: str | None = None,
+            train_labeled_value: int = 1,
+            mask_suffix: str = "",
+            binary_foreground: bool = False,
     ):
         super().__init__()
 
@@ -114,6 +118,10 @@ class ImageMaskDataset(Dataset):
         self.mask_color_map = mask_color_map
         self.mask_color_mode = mask_color_mode
         self.label_map = label_map
+        self.train_label_column = train_label_column
+        self.train_labeled_value = train_labeled_value
+        self.mask_suffix = mask_suffix
+        self.binary_foreground = binary_foreground
 
         self.setup(data_type, val_fold_id)
 
@@ -153,6 +161,8 @@ class ImageMaskDataset(Dataset):
             df = df[df['is_test'] == 2]
         else:  # train
             df = df[df['is_test'] == 0]
+            if self.train_label_column is not None and self.train_label_column in df.columns:
+                df = df[df[self.train_label_column] == self.train_labeled_value]
         return df
 
     def read_cv_dataset_csv(self):
@@ -184,9 +194,11 @@ class ImageMaskDataset(Dataset):
             split_root = os.path.join(self.dataset_root, "val")
         image_path = os.path.join(split_root, self.image_folder, img_id + self.data_ext)
         image = read_rgb_img(image_path)
-        mask = read_mask(os.path.join(split_root, self.mask_folder, img_id + self.data_ext))
+        mask = read_mask(os.path.join(split_root, self.mask_folder, img_id + self.mask_suffix + self.data_ext))
         mask = convert_color_mask(mask, self.mask_color_map, self.mask_color_mode)
         mask = remap_label_mask(mask, self.label_map)
+        if self.binary_foreground:
+            mask = (mask > 0).astype(np.uint8)
 
         if self.augmentation is not None:
             ret = self.augmentation(image=image, mask=mask)
@@ -261,6 +273,8 @@ class UnlabeledImageDataset(Dataset):
             dataset_root: str | None = None,
             source_csv_path: str | None = None,
             labeled_csv_path: str | None = None,
+            labeled_filter_column: str | None = None,
+            labeled_filter_value: int = 1,
             data_ext: str = ".png",
             image_folder: str = SUB_FOLDER_IMAGE,
             split_folders: bool = False,
@@ -278,7 +292,14 @@ class UnlabeledImageDataset(Dataset):
             self.image_dir = os.path.join(dataset_root, "train", image_folder) if split_folders else os.path.join(dataset_root, image_folder)
             source_df = pd.read_csv(source_csv_path, header=0)
             source_ids = set(source_df[source_df["is_test"] == 0]["img_id"].astype(str).tolist())
-            if labeled_csv_path is not None:
+            if labeled_filter_column is not None and labeled_filter_column in source_df.columns:
+                labeled_ids = set(
+                    source_df[
+                        (source_df["is_test"] == 0) & (source_df[labeled_filter_column] == labeled_filter_value)
+                    ]["img_id"].astype(str).tolist()
+                )
+                source_ids -= labeled_ids
+            elif labeled_csv_path is not None:
                 labeled_df = pd.read_csv(labeled_csv_path, header=0)
                 labeled_ids = set(labeled_df[labeled_df["is_test"] == 0]["img_id"].astype(str).tolist())
                 source_ids -= labeled_ids
@@ -346,11 +367,11 @@ class SemiSupervisedDataset(Dataset):
 class GeneralDataModule(LightningDataModule):
     def __init__(
         self,
-        common_cfg_dic,
-        dataset_classs,
-        cus_transforms,
-        batch_size,
-        num_workers,
+            common_cfg_dic,
+            dataset_classs,
+            cus_transforms,
+            batch_size,
+            num_workers,
         pin_memory=True,
         persistent_workers=None,
         prefetch_factor=None,
@@ -373,6 +394,8 @@ class GeneralDataModule(LightningDataModule):
         if self.semi_cfg is not None and self.semi_cfg.get("enabled", False):
             source_csv_path = self.semi_cfg.get("unlabeled_source_csv_path", None)
             image_dir = self.semi_cfg.get("unlabeled_image_dir", None)
+            labeled_filter_column = self.semi_cfg.get("labeled_filter_column", None)
+            labeled_filter_value = self.semi_cfg.get("labeled_filter_value", 1)
             if source_csv_path is None and image_dir is None:
                 image_dir = os.path.join(common_cfg_dic["dataset_root"], "unlabeled", common_cfg_dic["image_folder"])
             if source_csv_path is not None:
@@ -380,6 +403,8 @@ class GeneralDataModule(LightningDataModule):
                     dataset_root=common_cfg_dic["dataset_root"],
                     source_csv_path=source_csv_path,
                     labeled_csv_path=common_cfg_dic["dataset_csv_path"] if self.semi_cfg.get("exclude_labeled_from_unlabeled", True) else None,
+                    labeled_filter_column=labeled_filter_column,
+                    labeled_filter_value=labeled_filter_value,
                     data_ext=common_cfg_dic["data_ext"],
                     image_folder=common_cfg_dic["image_folder"],
                     split_folders=common_cfg_dic["split_folders"],

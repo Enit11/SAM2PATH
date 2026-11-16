@@ -13,6 +13,11 @@ __pycache__/
 outputs/
 logs/
 vis_compare/
+test_results/
+tensorboard/
+dataset_patient_split_seed42/
+Glas/
+uni2_h/
 paper_2604_23274v1.txt
 .workbuddy/
 .vscode/

@@ -103,5 +103,13 @@ def _build_sam(
     if checkpoint is not None:
         with open(checkpoint, "rb") as f:
             state_dict = torch.load(f)
-        sam.load_state_dict(state_dict)
+        mapped_state_dict = {}
+        for k, v in state_dict.items():
+            nk = k
+            mapped_state_dict[nk] = v
+        missing, unexpected = sam.load_state_dict(mapped_state_dict, strict=False)
+        if missing:
+            print(f"[WARN] SAM missing keys: {missing[:20]}{'...' if len(missing) > 20 else ''}")
+        if unexpected:
+            print(f"[WARN] SAM unexpected keys: {unexpected[:20]}{'...' if len(unexpected) > 20 else ''}")
     return sam

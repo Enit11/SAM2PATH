@@ -9,6 +9,7 @@ import os
 import random
 import sys
 import warnings
+import importlib
 
 import albumentations
 import cv2
@@ -35,7 +36,13 @@ class GlomeruliInference:
         4: (170, 0, 255),
     }
 
-    def __init__(self, ckpt_path: str, project_root: str = None, device: str = None):
+    def __init__(
+        self,
+        ckpt_path: str,
+        project_root: str = None,
+        device: str = None,
+        config_module: str = "configs.Glomeruli",
+    ):
         self.ckpt_path = ckpt_path
         self.project_root = project_root or r"C:\Users\ASUS\SAM2PATH"
         device_name = device or ("cuda" if torch.cuda.is_available() else "cpu")
@@ -45,11 +52,10 @@ class GlomeruliInference:
             sys.path.insert(0, self.project_root)
         os.chdir(self.project_root)
 
-        from configs.Glomeruli import cfg
         from image_mask_dataset import convert_color_mask, read_mask, read_rgb_img
         from main import get_metrics, get_model, get_pl_module
 
-        self.cfg = cfg
+        self.cfg = importlib.import_module(config_module).cfg
         self.convert_color_mask = convert_color_mask
         self.read_mask = read_mask
         self.read_rgb_img = read_rgb_img
@@ -62,12 +68,51 @@ class GlomeruliInference:
         if self.model is not None:
             return self.model
 
+        state = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
+        state_dict = state["state_dict"]
         sam_model = self.get_model(self.cfg)
         metrics = self.get_metrics(self.cfg)
         pl_module = self.get_pl_module(self.cfg, model=sam_model, metrics=metrics)
 
-        state = torch.load(self.ckpt_path, map_location="cpu", weights_only=False)
-        pl_module.load_state_dict(state["state_dict"], strict=False)
+        checkpoint_has_geometry = any(
+            key.startswith("model.boundary_head.") or key.startswith("model.distance_head.")
+            for key in state_dict
+        )
+        model_geometry_enabled = getattr(pl_module.model, "geometry_enabled", None)
+        if model_geometry_enabled is not None and checkpoint_has_geometry != model_geometry_enabled:
+            raise ValueError(
+                "Checkpoint and config build different model architectures: "
+                f"checkpoint_has_geometry={checkpoint_has_geometry}, "
+                f"config_geometry_enabled={model_geometry_enabled}. "
+                "Use the configuration that created this checkpoint."
+            )
+
+        for key in ("instance_memory", "instance_memory_ready", "instance_memory_ptr"):
+            state_dict.pop(key, None)
+        if "foundation_prototypes" in state_dict and hasattr(pl_module, "foundation_prototypes"):
+            loaded_proto = state_dict["foundation_prototypes"]
+            if loaded_proto.ndim == 2 and loaded_proto.shape[0] == pl_module.num_classes + 1:
+                pl_module.foundation_prototypes = loaded_proto.new_zeros(loaded_proto.shape)
+        if "foundation_proto_ready" in state_dict and hasattr(pl_module, "foundation_proto_ready"):
+            loaded_ready = state_dict["foundation_proto_ready"]
+            if loaded_ready.ndim == 1 and loaded_ready.shape[0] == pl_module.num_classes + 1:
+                pl_module.foundation_proto_ready = loaded_ready.new_zeros(loaded_ready.shape)
+        target_state = pl_module.state_dict()
+        incompatible = {
+            key: (tuple(value.shape), tuple(target_state[key].shape))
+            for key, value in state_dict.items()
+            if key in target_state and value.shape != target_state[key].shape
+        }
+        if incompatible:
+            print("[INFO] Skipping incompatible checkpoint tensors:")
+            for key, (source_shape, target_shape) in incompatible.items():
+                print(f"  {key}: checkpoint {source_shape} -> model {target_shape}")
+                state_dict.pop(key)
+        missing, unexpected = pl_module.load_state_dict(state_dict, strict=False)
+        if missing:
+            print(f"[INFO] Missing model tensors after partial load: {missing}")
+        if unexpected:
+            print(f"[INFO] Unexpected checkpoint tensors after partial load: {unexpected}")
         pl_module.to(self.device)
         pl_module.eval()
 
@@ -299,6 +344,61 @@ class GlomeruliInference:
         mask[~np.isin(mask, list(valid_classes) + [0])] = 0
         return mask
 
+    def uses_background_supervision(self) -> bool:
+        semi_cfg = getattr(self.cfg, "semi", None)
+        if semi_cfg is not None and bool(semi_cfg.get("background_supervision", False)):
+            return True
+        return "ignore_index" in self.cfg.dataset and self.cfg.dataset.ignore_index is None
+
+    def geometry_boundary_deadhesion(
+        self,
+        mask: np.ndarray,
+        prob_map: np.ndarray | None = None,
+        geometry: dict | None = None,
+        boundary_threshold: float = 0.55,
+        uncertain_margin_threshold: float = 0.18,
+        min_separator_area: int = 18,
+    ) -> np.ndarray:
+        """Use GASP boundary evidence as a thin separator instead of only visualizing it."""
+        if not geometry or "boundary_probability" not in geometry:
+            return mask
+
+        boundary = np.asarray(geometry["boundary_probability"], dtype=np.float32)
+        if boundary.shape != mask.shape:
+            boundary = cv2.resize(boundary, mask.shape[::-1], interpolation=cv2.INTER_LINEAR)
+
+        candidate = boundary >= boundary_threshold
+        if prob_map is not None and prob_map.shape[1:] == mask.shape:
+            foreground_classes = self.valid_foreground_classes()
+            foreground_probs = prob_map[foreground_classes]
+            if foreground_probs.shape[0] >= 2:
+                top2 = np.partition(foreground_probs, -2, axis=0)[-2:]
+                margin = top2[-1] - top2[-2]
+                candidate &= margin <= uncertain_margin_threshold
+
+        # Keep separators only where they touch at least two different foreground labels nearby.
+        out = mask.astype(np.uint8).copy()
+        foreground_classes = self.valid_foreground_classes()
+        separator = np.zeros_like(candidate, dtype=bool)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        for cls_id in foreground_classes:
+            dilated = cv2.dilate((out == cls_id).astype(np.uint8), kernel, iterations=1).astype(bool)
+            touches_other = np.zeros_like(candidate, dtype=bool)
+            for other_cls in foreground_classes:
+                if other_cls == cls_id:
+                    continue
+                touches_other |= cv2.dilate((out == other_cls).astype(np.uint8), kernel, iterations=1).astype(bool)
+            separator |= candidate & dilated & touches_other
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(separator.astype(np.uint8), 8)
+        kept = np.zeros_like(separator, dtype=bool)
+        for idx in range(1, num_labels):
+            if int(stats[idx, cv2.CC_STAT_AREA]) >= min_separator_area:
+                kept |= labels == idx
+
+        out[kept] = 0
+        return out
+
     def structure_semantic_refinement(
         self,
         mask: np.ndarray,
@@ -398,7 +498,16 @@ class GlomeruliInference:
 
         return out
 
-    def postprocess_prediction(self, mask: np.ndarray, prob_map: np.ndarray | None = None) -> np.ndarray:
+    def postprocess_prediction(
+        self,
+        mask: np.ndarray,
+        prob_map: np.ndarray | None = None,
+        geometry: dict | None = None,
+    ) -> np.ndarray:
+        if bool(self.cfg.get("inference", {}).get("preserve_raw_semantics", False)):
+            # Preserve annotated background lumina. No hole filling, closing,
+            # component relabelling or other morphology in the BSR protocol.
+            return mask.copy()
         valid_classes = set(self.valid_foreground_classes())
         if prob_map is not None:
             prob_map = prob_map.copy()
@@ -407,23 +516,10 @@ class GlomeruliInference:
                 prob_map[0] = np.maximum(prob_map[0], prob_map[invalid_classes].max(axis=0))
                 prob_map[invalid_classes] = 0
         mask = self.suppress_invalid_classes(mask)
-        mask = self.structure_semantic_refinement(mask, prob_map=prob_map)
         mask = self.relabel_small_components(mask)
         mask = self.refine_enclosed_components(mask)
         mask = self.apply_morphology(mask)
         mask = self.fill_small_background_holes(mask)
-        mask = self.structure_semantic_refinement(
-            mask,
-            prob_map=prob_map,
-            min_area=700,
-            dominant_area_ratio=0.70,
-            dominant_prob_margin=0.05,
-            max_relabel_ratio=0.26,
-            max_relabel_area=5500,
-            surround_radius=9,
-            min_surround_ratio=0.55,
-            prob_tolerance=0.06,
-        )
         mask = self.refine_enclosed_components(
             mask,
             max_area_by_class={
@@ -447,6 +543,8 @@ class GlomeruliInference:
             confidence_threshold=0.88,
             neighbor_ratio_threshold=0.6,
         )
+        if self.uses_background_supervision():
+            mask = self.geometry_boundary_deadhesion(mask, prob_map=prob_map, geometry=geometry)
         mask[~np.isin(mask, list(valid_classes) + [0])] = 0
         return mask
 
@@ -534,6 +632,20 @@ class GlomeruliInference:
         return probs.squeeze(0).cpu().numpy()
 
     @torch.no_grad()
+    def predict_geometry(self, image_tensor: torch.Tensor) -> dict:
+        """Export learned geometry heads for analysis when a GASP model provides them."""
+        pl_module = self.load_model()
+        prompt_model = pl_module.model
+        if not getattr(prompt_model, "geometry_enabled", False):
+            return {}
+        images = image_tensor.unsqueeze(0).to(self.device)
+        _, _, geometry = prompt_model(images, return_aux=True)
+        return {
+            "boundary_probability": torch.sigmoid(geometry["boundary_logits"]).squeeze().float().cpu().numpy(),
+            "distance_maps": geometry["distance_maps"].squeeze(0).float().cpu().numpy(),
+        }
+
+    @torch.no_grad()
     def capture_decoder_features(self, image_tensor: torch.Tensor) -> dict:
         pl_module = self.load_model()
         prompt_model = pl_module.model
@@ -581,47 +693,67 @@ class GlomeruliInference:
         image_tensor = self.preprocess_image(image)
         gt_mask_tensor = torch.from_numpy(gt_mask_label).long()
         prob_map = self.predict_probabilities(image_tensor)
+        geometry = self.predict_geometry(image_tensor)
         valid_classes = self.valid_foreground_classes()
-        pred_mask = np.zeros(prob_map.shape[1:], dtype=np.uint8)
-        if valid_classes:
-            valid_probs = prob_map[valid_classes]
-            pred_mask = np.asarray(valid_classes, dtype=np.uint8)[np.argmax(valid_probs, axis=0)]
+        if self.uses_background_supervision():
+            pred_mask = np.argmax(prob_map, axis=0).astype(np.uint8)
+        else:
+            pred_mask = np.zeros(prob_map.shape[1:], dtype=np.uint8)
+            if valid_classes:
+                valid_probs = prob_map[valid_classes]
+                pred_mask = np.asarray(valid_classes, dtype=np.uint8)[np.argmax(valid_probs, axis=0)]
         pred_mask = self.suppress_invalid_classes(pred_mask)
-        pred_mask = pred_mask * (gt_mask_label > 0).astype(np.uint8)
-        pred_mask_pp = self.postprocess_prediction(pred_mask, prob_map=prob_map)
+        if not self.uses_background_supervision():
+            pred_mask = pred_mask * (gt_mask_label > 0).astype(np.uint8)
+        pred_mask_pp = self.postprocess_prediction(pred_mask, prob_map=prob_map, geometry=geometry)
         gt_mask_eval = gt_mask_label
         max_prob = prob_map.max(axis=0)
         max_prob_vis = (np.clip(max_prob, 0, 1) * 255).astype(np.uint8)
 
         return {
             "original_image": image_resized,
+            "raw_prediction": pred_mask,
             "prediction": pred_mask_pp,
             "gt_mask": gt_mask_eval,
             "gt_color": gt_mask_color,
+            "raw_pred_color": self.colorize_mask(pred_mask),
             "pred_color": self.colorize_mask(pred_mask_pp),
             "gt_overlay": self.overlay_color_mask(image_resized, gt_mask_color),
+            "raw_pred_overlay": self.overlay_mask(image_resized, pred_mask),
             "pred_overlay": self.overlay_mask(image_resized, pred_mask_pp),
             "prob_map": prob_map,
             "max_prob_vis": max_prob_vis,
+            "geometry": geometry,
         }
 
     def create_comparison_image(self, image_name: str, infer_result: dict) -> np.ndarray:
         img = infer_result["original_image"]
 
-        top = np.concatenate(
-            [img, infer_result["gt_color"], infer_result["pred_color"]],
-            axis=1,
-        )
-        bottom = np.concatenate(
-            [img, infer_result["gt_overlay"], infer_result["pred_overlay"]],
-            axis=1,
-        )
+        if "raw_pred_color" in infer_result:
+            top = np.concatenate(
+                [img, infer_result["gt_color"], infer_result["raw_pred_color"], infer_result["pred_color"]],
+                axis=1,
+            )
+            bottom = np.concatenate(
+                [img, infer_result["gt_overlay"], infer_result["raw_pred_overlay"], infer_result["pred_overlay"]],
+                axis=1,
+            )
+        else:
+            top = np.concatenate(
+                [img, infer_result["gt_color"], infer_result["pred_color"]],
+                axis=1,
+            )
+            bottom = np.concatenate(
+                [img, infer_result["gt_overlay"], infer_result["pred_overlay"]],
+                axis=1,
+            )
         prob_vis = cv2.applyColorMap(infer_result["max_prob_vis"], cv2.COLORMAP_JET)
         prob_vis = cv2.cvtColor(prob_vis, cv2.COLOR_BGR2RGB)
-        prob_row = np.concatenate(
-            [img, prob_vis, prob_vis],
-            axis=1,
-        )
+        row_width = top.shape[1]
+        prob_row = np.concatenate([img, prob_vis], axis=1)
+        if prob_row.shape[1] < row_width:
+            pad = np.zeros((img.shape[0], row_width - prob_row.shape[1], 3), dtype=np.uint8)
+            prob_row = np.concatenate([prob_row, pad], axis=1)
         canvas = np.concatenate([top, bottom, prob_row], axis=0)
 
         cv2.putText(
@@ -644,13 +776,23 @@ class GlomeruliInference:
         )
         cv2.putText(
             canvas,
-            "Prediction",
+            "Raw Prediction" if "raw_pred_color" in infer_result else "Prediction",
             (img.shape[1] * 2 + 20, 35),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
             (255, 255, 255),
             2,
         )
+        if "raw_pred_color" in infer_result:
+            cv2.putText(
+                canvas,
+                "Boundary-Deadhesion",
+                (img.shape[1] * 3 + 20, 35),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                1.0,
+                (255, 255, 255),
+                2,
+            )
         cv2.putText(
             canvas,
             "Max Prob",
@@ -676,6 +818,14 @@ class GlomeruliInference:
             cls_prob = (np.clip(prob_map[cls_id], 0, 1) * 255).astype(np.uint8)
             out_path = os.path.join(prob_dir, f"class_{cls_id}_probability.png")
             cv2.imwrite(out_path, cls_prob)
+
+        geometry = infer_result.get("geometry", {})
+        if geometry:
+            boundary = (np.clip(geometry["boundary_probability"], 0, 1) * 255).astype(np.uint8)
+            cv2.imwrite(os.path.join(prob_dir, "predicted_boundary_probability.png"), boundary)
+            for cls_idx, distance_map in enumerate(geometry["distance_maps"], start=1):
+                distance_vis = ((np.clip(distance_map, -1, 1) + 1.0) * 127.5).astype(np.uint8)
+                cv2.imwrite(os.path.join(prob_dir, f"class_{cls_idx}_signed_distance.png"), distance_vis)
 
     def save_decoder_feature_maps(
         self,
@@ -782,6 +932,7 @@ def run_inference(
     num_samples: int = 5,
     seed: int = 42,
     project_root: str = None,
+    config_module: str = "configs.Glomeruli_uni2_fusion",
 ) -> bool:
     print("\n" + "=" * 70)
     print("SAM2PATH Glomeruli Segmentation - Inference")
@@ -800,14 +951,24 @@ def run_inference(
     files = sorted(files)
     print(f"  [OK] Found {len(files)} test images")
 
-    print(f"\n[2/4] Randomly selecting {num_samples} images...")
-    picked = random.sample(files, k=min(num_samples, len(files)))
+    if num_samples <= 0 or num_samples >= len(files):
+        picked = files
+        selection_note = f"all {len(files)}"
+    else:
+        # A fixed seed gives a reproducible subset while avoiding the previous
+        # misleading behavior where num_samples was ignored and every test
+        # image was processed.
+        picked = sorted(random.sample(files, num_samples))
+        selection_note = f"a reproducible random subset of {len(picked)}/{len(files)}"
+    print(f"\n[2/4] Using {selection_note} test images...")
     for i, name in enumerate(picked, 1):
         print(f"  [{i}] {name}")
 
     print("\n[3/4] Loading model...")
     try:
-        inferencer = GlomeruliInference(ckpt_path, project_root)
+        inferencer = GlomeruliInference(
+            ckpt_path, project_root, config_module=config_module
+        )
         inferencer.load_model()
         print("  [OK] Model loaded")
         print(f"  Device: {inferencer.device}")
@@ -848,12 +1009,12 @@ def run_inference(
 if __name__ == "__main__":
     success = run_inference(
         ckpt_path=(
-            r"C:\Users\ASUS\SAM2PATH\outputs\glomeruli\run\glomeruli_train\Logs"
-            r"\20260519-193700\sam2path\version_0\checkpoints\epoch=39-step=7880.ckpt"
+            r"C:\Users\ASUS\SAM2PATH\outputs\glomeruli\run\glomeruli_uni2_resume2\Logs"
+            r"\20260916-145447\sam2path\version_0\checkpoints\epoch=64-step=10010.ckpt"
         ),
-        image_dir=r"C:\Users\ASUS\SAM2PATH\dataset\test\image",
-        mask_dir=r"C:\Users\ASUS\SAM2PATH\dataset\test\mask",
-        output_dir=r"C:\Users\ASUS\SAM2PATH\vis_compare\glomeruli_train_epoch39_random5_gtmask",
+        image_dir=r"C:\Users\ASUS\SAM2PATH\dataset_patient_split_seed42\test\image",
+        mask_dir=r"C:\Users\ASUS\SAM2PATH\dataset_patient_split_seed42\test\mask",
+        output_dir=r"C:\Users\ASUS\SAM2PATH\vis_compare\glomeruli_uni2_epoch64_random5_gtmask",
         num_samples=5,
         seed=42,
         project_root=r"C:\Users\ASUS\SAM2PATH",

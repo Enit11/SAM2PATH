@@ -2,18 +2,18 @@ from box import Box
 
 
 config = {
-    "batch_size": 3,
-    "num_workers": 6,
+    "batch_size": 2,
+    "num_workers": 2,
     "pin_memory": True,
-    "persistent_workers": True,
-    "prefetch_factor": 4,
+    "persistent_workers": False,
+    "prefetch_factor": 2,
     "train_drop_last": True,
     "benchmark": True,
     "out_dir": "outputs/glomeruli",
     "check_val_every_n_epoch": 5,
     "log_every_n_steps": 20,
     "opt": {
-        "num_epochs": 80,
+        "num_epochs": 100,
         "learning_rate": 1e-4,
         "weight_decay": 1e-2,
         "precision": "bf16-mixed",
@@ -22,7 +22,7 @@ config = {
     },
     "model": {
         "type": "vit_b",
-        "checkpoint": "",
+        "checkpoint": r"C:\Users\ASUS\SAM2PATH\checkpoints\sam_vit_b_01ec64.pth",
         "freeze": {
             "image_encoder": True,
             "prompt_encoder": False,
@@ -34,6 +34,12 @@ config = {
         "extra_encoder": None,
         "extra_type": "sam2_fusion_nokan",
         "extra_checkpoint": None,
+        "no_sam": False,
+        "geometry": {
+            "enabled": False,
+            "multi_scale_adapter": False,
+            "head_channels": 64,
+        },
     },
     "loss": {
         "focal_cof": 0.125,
@@ -44,30 +50,96 @@ config = {
         "rc_sigma": 0.5,
     },
     "dataset": {
-        "dataset_root": "dataset",
-        "dataset_csv_path": "dataset_cfg/glomeruli_cv.csv",
+        "dataset_root": "dataset_patient_split_seed42",
+        "dataset_csv_path": "dataset_cfg/glomeruli_split_10pct_seed42.csv",
         "data_ext": ".png",
         "val_fold_id": -1,
-        "num_classes": 4,
-        "ignored_classes": 0,
+        # Number of *foreground* classes.  Class 0 is the supervised
+        # background/non-target class, so the model/metrics use 3 + 1 = 4
+        # channels/classes (labels 0, 1, 2, 3).
+        "num_classes": 3,
+        "ignored_classes": None,
         "ignored_classes_metric": None,
-        "ignore_index": 0,
+        # Background is a valid class, not an unlabeled/void pixel.  Keep it
+        # in the loss, argmax prediction, and metrics.
+        "ignore_index": None,
         "image_hw": (1024, 1024),
         "feature_input": False,
+        "train_label_column": "labeled",
+        "train_labeled_value": 1,
         "image_folder": "image",
         "mask_folder": "mask",
         "split_folders": True,
         "mask_color_mode": "bgr",
         "mask_color_map": {
-            (0, 0, 0): 0,        # background
-            (46, 254, 100): 1,   # glomerulus
-            (0, 0, 255): 2,      # tubule, red in the source mask
-            (255, 0, 0): 3,      # vessel, blue in the source mask
-            (255, 0, 170): 0,    # unlabeled/other
-            (88, 250, 244): 0,   # unlabeled/other
+            (0, 0, 0): 0,
+            (46, 254, 100): 1,
+            (0, 0, 255): 2,
+            (255, 0, 0): 3,
+            (255, 0, 170): 0,
+            (88, 250, 244): 0,
         },
         "dataset_mean": (0.485, 0.456, 0.406),
         "dataset_std": (0.229, 0.224, 0.225),
+    },
+    "semi": {
+        "enabled": True,
+        "unlabeled_source_csv_path": "dataset_cfg/glomeruli_split_10pct_seed42.csv",
+        "exclude_labeled_from_unlabeled": True,
+        "labeled_filter_column": "labeled",
+        "labeled_filter_value": 1,
+        "unlabeled_ratio": 1,
+        "ema_decay": 0.999,
+        "consistency_coef": 1.0,
+        "warmup_epochs": 10,
+        "conf_threshold": 0.8,
+        "loss_type": "mse",
+        "prototype": {
+            "enabled": True,
+            "warmup_epochs": 5,
+            "momentum": 0.99,
+            "conf_threshold": 0.85,
+            "temperature": 0.1,
+            "region_proto_coef": 0.05,
+            "intra_region_coef": 0.02,
+            "sep_coef": 0.0,
+            "min_region_pixels": 6,
+            "min_region_purity": 0.7,
+            "max_regions_per_image": 16,
+            "max_pixels_per_region": 128,
+            "use_unlabeled": True,
+            "memory": {
+                "enabled": True,
+                "warmup_epochs": 10,
+                "size_per_class": 16,
+                "momentum": 0.9,
+                "conf_threshold": 0.9,
+                "min_region_pixels": 32,
+                "min_region_purity": 0.9,
+                "temperature": 0.1,
+                "similarity_threshold": 0.35,
+                "consistency_coef": 0.05,
+                "interior_width": 3,
+                "unlabeled_weight": 1.0,
+            },
+        },
+        "geometry": {
+            "enabled": False,
+            "warmup_epochs": 10,
+            "boundary_coef": 0.0,
+            "distance_coef": 0.0,
+            "hard_ce_coef": 0.0,
+            "unsup_coef": 0.0,
+            "broadcast_coef": 0.0,
+            "boundary_width": 3,
+            "sdf_truncation": 32.0,
+            "entropy_threshold": 0.45,
+            "margin_threshold": 2.0,
+            "boundary_threshold": 0.35,
+            "teacher_conf_threshold": 0.8,
+            "vessel_boundary_weight": 1.0,
+        },
+        "background_supervision": True,
     },
 }
 

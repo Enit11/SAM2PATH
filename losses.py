@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from monai.losses import DiceLoss, FocalLoss
+from monai.losses import DiceLoss
 
 # To deal with unlabeled region for losses: make prediciton & target all zero
 # To deal with unlabeled region for metrics: torchmetrics support ignore_index
@@ -16,6 +16,9 @@ class SAMLoss(nn.Module):
         iou_cof: float = 1.,
         rc_cof: float = 0.,
         rc_sigma: float = 0.5,
+        ignore_index: int | None = None,
+        class_weights: list[float] | None = None,
+        focal_gamma: float = 2.0,
     ):
         super().__init__()
         self.focal_cof = focal_cof
@@ -24,10 +27,14 @@ class SAMLoss(nn.Module):
         self.iou_cof = iou_cof
         self.rc_cof = rc_cof
         self.rc_sigma = rc_sigma
+        self.ignore_index = ignore_index
+        self.focal_gamma = float(focal_gamma)
+        if class_weights is None:
+            self.register_buffer("class_weights", None)
+        else:
+            self.register_buffer("class_weights", torch.tensor(class_weights, dtype=torch.float32))
 
-        self.dice_loss_fn = DiceLoss(include_background=False, to_onehot_y=False, sigmoid=False, softmax=False)
-        self.focal_loss_fn = FocalLoss(include_background=False, to_onehot_y=False)
-        self.ce_loss_fn = nn.CrossEntropyLoss(ignore_index=0)
+        self.dice_loss_fn = DiceLoss(include_background=True, to_onehot_y=False, sigmoid=False, softmax=False)
 
     @torch.no_grad()
     def to_one_hot_label(self, targets, num_classes):
@@ -55,26 +62,54 @@ class SAMLoss(nn.Module):
         loss_y = (diff_y * weight_y).sum() / weight_y.sum().clamp_min(1.0)
         return 0.5 * (loss_x + loss_y)
 
-    def forward(self, inputs, targets, iou_pred, ignored_masks=None, images=None):
-        # masks for ignored regions
-        if ignored_masks is not None:
-            inputs = inputs * (1. - ignored_masks.expand_as(inputs))
-            targets = targets * (1 - ignored_masks.long().squeeze(1))
+    def class_balanced_focal_loss(self, inputs, targets, valid_mask):
+        """Apply focal modulation and the configured class weight at each pixel."""
+        log_probs = F.log_softmax(inputs, dim=1)
+        log_pt = log_probs.gather(1, targets.unsqueeze(1)).squeeze(1)
+        focal = -(1.0 - log_pt.exp()).pow(self.focal_gamma) * log_pt
+        if self.class_weights is not None:
+            focal = focal * self.class_weights[targets]
+        focal = focal * valid_mask.float()
+        return focal.sum() / valid_mask.float().sum().clamp_min(1.0)
 
-        targets_one_hot = self.to_one_hot_label(targets, num_classes=inputs.shape[1])
+    def forward(self, inputs, targets, iou_pred, ignored_masks=None, images=None):
+        # Fail early with a useful message instead of an asynchronous CUDA
+        # device-side assert from one_hot/gather when a mask contains an
+        # invalid class id.
+        if targets.dtype != torch.long:
+            targets = targets.long()
+        n_channels = int(inputs.shape[1])
+        valid_targets = targets if self.ignore_index is None else targets[targets != self.ignore_index]
+        if valid_targets.numel() and (int(valid_targets.min()) < 0 or int(valid_targets.max()) >= n_channels):
+            raise ValueError(
+                f"GT label out of range: min={int(valid_targets.min())}, "
+                f"max={int(valid_targets.max())}, model channels={n_channels}, "
+                f"ignore_index={self.ignore_index}. Expected labels "
+                f"0..{n_channels - 1}."
+            )
+        valid_mask = torch.ones_like(targets, dtype=torch.bool)
+        if ignored_masks is not None:
+            valid_mask = ~ignored_masks.squeeze(1).bool()
+
+        safe_targets = targets.masked_fill(~valid_mask, 0)
+        targets_one_hot = self.to_one_hot_label(safe_targets, num_classes=inputs.shape[1]).float()
 
         inputs_softmax = F.softmax(inputs, dim=1)
 
-        dice = self.dice_loss_fn(inputs_softmax, targets_one_hot)
-        focal = self.focal_loss_fn(inputs, targets_one_hot)
+        valid_channels = valid_mask.unsqueeze(1).float()
+        dice = self.dice_loss_fn(inputs_softmax * valid_channels, targets_one_hot * valid_channels)
+        focal = self.class_balanced_focal_loss(inputs, safe_targets, valid_mask)
 
 
-        iou_true = calc_iou(inputs_softmax, targets_one_hot)
+        iou_true = calc_iou(inputs_softmax * valid_channels, targets_one_hot * valid_channels)
         iou = F.mse_loss(iou_pred[:, 1:], iou_true[:, 1:]) # ignore background
         # iou = 0.
 
-        ce_loss = self.ce_loss_fn(inputs, targets)
-        rc_loss = self.region_consistency_loss(inputs_softmax, targets, images=images)
+        ce_kwargs = {"weight": self.class_weights}
+        if self.ignore_index is not None:
+            ce_kwargs["ignore_index"] = self.ignore_index
+        ce_loss = F.cross_entropy(inputs, targets, **ce_kwargs)
+        rc_loss = self.region_consistency_loss(inputs_softmax, safe_targets, images=images)
 
         total_loss = (
             self.focal_cof * focal
